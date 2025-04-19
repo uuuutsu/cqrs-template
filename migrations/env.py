@@ -1,29 +1,47 @@
+import asyncio
 from logging.config import fileConfig
-
-from sqlalchemy import engine_from_config
-from sqlalchemy import pool
+from typing import Iterable
 
 from alembic import context
+from alembic.operations.ops import MigrationScript
+from alembic.runtime.migration import MigrationContext
+from alembic.script import ScriptDirectory
+from sqlalchemy import pool
+from sqlalchemy.engine import Connection
+from sqlalchemy.ext.asyncio import async_engine_from_config
 
-# this is the Alembic Config object, which provides
-# access to the values within the .ini file in use.
+from src.config.core import load_config
+from src.database.alchemy.entity import Entity
+
+
 config = context.config
 
-# Interpret the config file for Python logging.
-# This line sets up loggers basically.
+
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-# add your model's MetaData object here
-# for 'autogenerate' support
-# from myapp import mymodel
-# target_metadata = mymodel.Base.metadata
-target_metadata = None
+target_metadata = Entity.metadata
 
-# other values from the config, defined by the needs of env.py,
-# can be acquired:
-# my_important_option = config.get_main_option("my_important_option")
-# ... etc.
+if not config.get_main_option("sqlalchemy.url"):
+    url = load_config().db.url()
+else:
+    url = config.get_main_option("sqlalchemy.url") # type: ignore
+
+
+def add_number_to_migrations(
+    context: MigrationContext,
+    revision: str | None | Iterable[str | None],
+    directives: list[MigrationScript],
+) -> None:
+    migration_script = directives[0]
+    head_revision = ScriptDirectory.from_config(context.config).get_current_head()  # type: ignore
+    if head_revision is None:
+        new_rev_id = 1
+    else:
+        last_rev_id = int(head_revision.split("_")[0])
+        new_rev_id = last_rev_id + 1
+
+    migration_script.rev_id = f"{new_rev_id:05}_{migration_script.rev_id}"
 
 
 def run_migrations_offline() -> None:
@@ -38,7 +56,7 @@ def run_migrations_offline() -> None:
     script output.
 
     """
-    url = config.get_main_option("sqlalchemy.url")
+
     context.configure(
         url=url,
         target_metadata=target_metadata,
@@ -50,26 +68,51 @@ def run_migrations_offline() -> None:
         context.run_migrations()
 
 
-def run_migrations_online() -> None:
-    """Run migrations in 'online' mode.
+def do_run_migrations(connection: Connection) -> None:
+    context.configure(
+        connection=connection,
+        target_metadata=target_metadata,
+        process_revision_directives=add_number_to_migrations,
+    )
 
-    In this scenario we need to create an Engine
+    with context.begin_transaction():
+        context.run_migrations()
+
+
+async def run_async_migrations() -> None:
+    """In this scenario we need to create an Engine
     and associate a connection with the context.
 
     """
-    connectable = engine_from_config(
+
+    connectable = async_engine_from_config(
         config.get_section(config.config_ini_section, {}),
         prefix="sqlalchemy.",
         poolclass=pool.NullPool,
+        future=True,
+        url=url
     )
 
-    with connectable.connect() as connection:
-        context.configure(
-            connection=connection, target_metadata=target_metadata
-        )
+    async with connectable.connect() as connection:
+        await connection.run_sync(do_run_migrations)
 
-        with context.begin_transaction():
-            context.run_migrations()
+    await connectable.dispose()
+
+
+
+
+def run_migrations_online() -> None:
+    """Run migrations in 'online' mode."""
+
+    connectable = config.attributes.get("connection", None)
+
+    if connectable:
+        do_run_migrations(connectable)
+    else:
+        asyncio.run(run_async_migrations())
+
+
+
 
 
 if context.is_offline_mode():
